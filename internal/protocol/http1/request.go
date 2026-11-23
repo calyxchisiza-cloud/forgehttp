@@ -2,7 +2,10 @@
 // It does not use net/http.
 package http1
 
-import "errors"
+import (
+	"context"
+	"errors"
+)
 
 const (
 	// DefaultMaxRequestLine is the most bytes in the request line, including CRLF.
@@ -75,6 +78,23 @@ type Request struct {
 	Header        Header
 	Body          []byte
 	ContentLength int64
+	ctx           context.Context
+}
+
+// Context returns the request context. It is never nil.
+func (r *Request) Context() context.Context {
+	if r == nil || r.ctx == nil {
+		return context.Background()
+	}
+	return r.ctx
+}
+
+// SetContext replaces the request context. A nil context clears it to the background context.
+func (r *Request) SetContext(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	r.ctx = ctx
 }
 
 var (

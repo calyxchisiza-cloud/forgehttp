@@ -2,6 +2,7 @@ package http1
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"io"
 	"strings"
@@ -171,6 +172,19 @@ func TestReadRequestRepeatedHeaders(t *testing.T) {
 	got := req.Header.Values("Accept")
 	if len(got) != 2 || got[0] != "text/plain" || got[1] != "application/json" {
 		t.Fatalf("Accept %#v", got)
+	}
+}
+
+func TestRequestContext(t *testing.T) {
+	req := &Request{}
+	if req.Context().Err() != nil {
+		t.Fatal("default context is cancelled")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	req.SetContext(ctx)
+	cancel()
+	if req.Context().Err() == nil {
+		t.Fatal("cancelled context was not visible")
 	}
 }
 

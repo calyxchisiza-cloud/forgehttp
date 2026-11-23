@@ -31,10 +31,45 @@ func TestTwoClientsSequentially(t *testing.T) {
 	}
 }
 
-func TestSecondClientWaitsForTheFirst(t *testing.T) {
+func TestSecondClientServedWhileFirstIsOpen(t *testing.T) {
 	var once sync.Once
 	accepted := make(chan struct{})
 	srv := &Server{
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		onAccepted: func(net.Conn) {
+			once.Do(func() { close(accepted) })
+		},
+	}
+	registerHello(t, srv)
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	first, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	if _, err := first.Write([]byte("GET /")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first connection was not accepted")
+	}
+
+	body := roundTrip(t, addr, "GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	if body != http1.HelloMessage {
+		t.Fatalf("second body %q", body)
+	}
+}
+
+func TestConnectionLimitHoldsFurtherClients(t *testing.T) {
+	var once sync.Once
+	accepted := make(chan struct{})
+	srv := &Server{
+		MaxConns:     1,
 		ReadTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 		onAccepted: func(net.Conn) {
@@ -70,7 +105,7 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	_ = second.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	buf := make([]byte, 32)
 	if n, err := second.Read(buf); err == nil {
-		t.Fatalf("second client was served while the first connection was open: %q", buf[:n])
+		t.Fatalf("client past the connection limit was served: %q", buf[:n])
 	} else if !isTimeout(err) {
 		t.Fatalf("second client read: %v", err)
 	}
@@ -82,6 +117,91 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	body := readResponseBody(t, second)
 	if body != http1.HelloMessage {
 		t.Fatalf("second body %q", body)
+	}
+}
+
+func TestHandlersOverlapAndKeepSharedState(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	free := func() { releaseOnce.Do(func() { close(release) }) }
+	defer free()
+	var mu sync.Mutex
+	var n int
+	srv := &Server{
+		MaxConns:     2,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	}
+	if err := srv.Handle("GET", "/n", func(*http1.Request) *http1.Response {
+		mu.Lock()
+		n++
+		current := n
+		mu.Unlock()
+		if current <= 2 {
+			started <- struct{}{}
+			<-release
+		}
+		return http1.Text(200, strconv.Itoa(current))
+	}); err != nil {
+		t.Fatal(err)
+	}
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	const total = 6
+	type result struct {
+		body string
+		err  error
+	}
+	results := make(chan result, total)
+	for i := 0; i < total; i++ {
+		go func() {
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+			if _, err := conn.Write([]byte("GET /n HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
+				results <- result{err: err}
+				return
+			}
+			_, body, _, err := readResponseErr(conn)
+			if err != nil {
+				results <- result{err: err}
+				return
+			}
+			results <- result{body: body}
+		}()
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(2 * time.Second):
+			t.Fatal("handlers did not run at the same time")
+		}
+	}
+	free()
+
+	seen := map[string]struct{}{}
+	for i := 0; i < total; i++ {
+		got := <-results
+		if got.err != nil {
+			t.Fatal(got.err)
+		}
+		seen[got.body] = struct{}{}
+	}
+	if len(seen) != total {
+		t.Fatalf("shared counter produced %d distinct bodies: %v", len(seen), seen)
+	}
+	mu.Lock()
+	gotN := n
+	mu.Unlock()
+	if gotN != total {
+		t.Fatalf("counter %d", gotN)
 	}
 }
 
@@ -348,16 +468,23 @@ func readResponseBody(t *testing.T, r io.Reader) string {
 
 func readResponse(t *testing.T, r io.Reader) (status, body string, contentLength int) {
 	t.Helper()
-	br := bufio.NewReader(r)
-	var err error
-	status, err = br.ReadString('\n')
+	status, body, contentLength, err := readResponseErr(r)
 	if err != nil {
 		t.Fatal(err)
 	}
+	return status, body, contentLength
+}
+
+func readResponseErr(r io.Reader) (status, body string, contentLength int, err error) {
+	br := bufio.NewReader(r)
+	status, err = br.ReadString('\n')
+	if err != nil {
+		return "", "", 0, err
+	}
 	for {
-		line, err := br.ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
+		line, readErr := br.ReadString('\n')
+		if readErr != nil {
+			return "", "", 0, readErr
 		}
 		if line == "\r\n" {
 			break
@@ -365,15 +492,15 @@ func readResponse(t *testing.T, r io.Reader) (status, body string, contentLength
 		if strings.HasPrefix(line, "Content-Length: ") {
 			contentLength, err = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Content-Length: ")))
 			if err != nil {
-				t.Fatal(err)
+				return "", "", 0, err
 			}
 		}
 	}
 	buf := make([]byte, contentLength)
-	if _, err := io.ReadFull(br, buf); err != nil {
-		t.Fatal(err)
+	if _, err = io.ReadFull(br, buf); err != nil {
+		return "", "", 0, err
 	}
-	return status, string(buf), contentLength
+	return status, string(buf), contentLength, nil
 }
 
 func isTimeout(err error) bool {

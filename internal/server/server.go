@@ -1,5 +1,5 @@
-// Package server accepts TCP connections one at a time and shuts them down
-// when its context is cancelled.
+// Package server accepts TCP connections and serves each one on its own
+// goroutine. Cancelling the context closes the listener and every connection.
 package server
 
 import (
@@ -17,8 +17,12 @@ import (
 	"forgehttp/internal/transport"
 )
 
-// Server is a sequential TCP accept loop.
-// A connected client is served to completion before Accept is called again.
+// defaultMaxConns is the connection limit when MaxConns is zero.
+const defaultMaxConns = 100
+
+// Server accepts connections and serves each one on its own goroutine.
+// A connection handles one request, then closes. Requests on one connection
+// stay in order because that goroutine does not pipeline them.
 type Server struct {
 	// Addr is the host:port to bind. Empty means 127.0.0.1:8080.
 	Addr string
@@ -31,6 +35,11 @@ type Server struct {
 	// Zero uses 10 seconds.
 	WriteTimeout time.Duration
 
+	// MaxConns is how many connections may be served at once.
+	// Zero uses 100. At the limit, Accept waits and further clients stay in
+	// the kernel listen queue.
+	MaxConns int
+
 	// Limits bound the request line, headers, and body. Zero values use protocol defaults.
 	Limits http1.Limits
 
@@ -39,14 +48,16 @@ type Server struct {
 	Logger *log.Logger
 
 	// onAccepted, when set, runs after a connection is tracked and before the
-	// request is read. Tests use it to observe the sequential loop.
+	// request is read. Tests use it to observe that a connection was accepted.
 	onAccepted func(net.Conn)
 
 	routes *router.Router
 
 	mu      sync.Mutex
 	closing bool
-	active  net.Conn
+	conns   map[net.Conn]struct{}
+	slots   chan struct{}
+	wg      sync.WaitGroup
 }
 
 // ListenAndServe binds Addr and serves until ctx is cancelled or Accept fails.
@@ -64,12 +75,28 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 }
 
 // Serve accepts from ln until ctx is cancelled or Accept fails.
-// Serve closes ln before it returns.
+// Each accepted connection is served on its own goroutine.
+// Serve closes ln and waits for those goroutines before it returns.
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
+	if s.isClosing() {
+		_ = ln.Close()
+		return nil
+	}
+
 	// Cancelling this child context on return releases the shutdown goroutine
 	// even when Serve stops for a reason other than the caller's cancel.
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	defer func() {
+		// Cancel first so beginShutdown closes the listener and every connection.
+		// Wait after that, or a handler still blocked in Read would stall Serve.
+		cancel()
+		s.wg.Wait()
+	}()
+
+	s.mu.Lock()
+	s.conns = make(map[net.Conn]struct{})
+	s.slots = make(chan struct{}, s.maxConns())
+	s.mu.Unlock()
 
 	go func() {
 		<-ctx.Done()
@@ -79,8 +106,14 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.logger().Printf("listening on %s", ln.Addr())
 
 	for {
+		// Taking a slot before Accept stops the loop at MaxConns. The listen
+		// queue then holds new clients until a connection goroutine finishes.
+		if !s.takeSlot(ctx) {
+			return nil
+		}
 		conn, err := ln.Accept()
 		if err != nil {
+			s.releaseSlot()
 			if s.isClosing() || ctx.Err() != nil {
 				return nil
 			}
@@ -92,7 +125,13 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
-		s.serve(ctx, conn)
+		if !s.track(conn) {
+			s.releaseSlot()
+			_ = conn.Close()
+			return nil
+		}
+		s.wg.Add(1)
+		go s.serve(ctx, conn)
 	}
 }
 
@@ -102,10 +141,9 @@ func (s *Server) Handle(method, path string, h router.Handler) error {
 }
 
 func (s *Server) serve(ctx context.Context, conn net.Conn) {
+	defer s.wg.Done()
+	defer s.releaseSlot()
 	defer conn.Close()
-	if !s.track(conn) {
-		return
-	}
 	defer s.untrack(conn)
 
 	s.logger().Printf("accepted %s", conn.RemoteAddr())
@@ -164,6 +202,26 @@ func (s *Server) router() *router.Router {
 	return s.routes
 }
 
+func (s *Server) maxConns() int {
+	if s.MaxConns > 0 {
+		return s.MaxConns
+	}
+	return defaultMaxConns
+}
+
+func (s *Server) takeSlot(ctx context.Context) bool {
+	select {
+	case s.slots <- struct{}{}:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Server) releaseSlot() {
+	<-s.slots
+}
+
 func (s *Server) readTimeout() time.Duration {
 	if s.ReadTimeout > 0 {
 		return s.ReadTimeout
@@ -181,13 +239,16 @@ func (s *Server) writeTimeout() time.Duration {
 func (s *Server) beginShutdown(ln net.Listener) {
 	s.mu.Lock()
 	s.closing = true
-	conn := s.active
+	conns := make([]net.Conn, 0, len(s.conns))
+	for conn := range s.conns {
+		conns = append(conns, conn)
+	}
 	s.mu.Unlock()
 
 	// Accept and a blocked Read both have to wake up. Closing the listener
-	// unblocks Accept. Closing the active conn unblocks Read.
+	// unblocks Accept. Closing every connection unblocks its Read.
 	_ = ln.Close()
-	if conn != nil {
+	for _, conn := range conns {
 		_ = conn.Close()
 	}
 }
@@ -198,16 +259,14 @@ func (s *Server) track(conn net.Conn) bool {
 	if s.closing {
 		return false
 	}
-	s.active = conn
+	s.conns[conn] = struct{}{}
 	return true
 }
 
 func (s *Server) untrack(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.active == conn {
-		s.active = nil
-	}
+	delete(s.conns, conn)
 }
 
 func (s *Server) isClosing() bool {

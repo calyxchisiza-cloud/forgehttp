@@ -1,6 +1,6 @@
 # ForgeHTTP
 
-Phase 4 routes by exact method and path. The server still accepts one TCP connection at a time on `127.0.0.1:8080`.
+Phase 5 serves each TCP connection on its own goroutine. The accept loop allows 100 connections at once. A connection still handles one request and then closes.
 
 `go run ./cmd/forgehttp` registers `GET /` and `GET /hello`. A matching request receives:
 
@@ -13,7 +13,7 @@ Connection: close
 {"message":"Hello from ForgeHTTP"}
 ```
 
-`Content-Length` is the number of body bytes. An unknown path is 404. A known path with another method is 405. A malformed request receives an error status such as 400, 413, 431, 501, or 505. A goroutine per connection is a later phase. See [docs/architecture.md](docs/architecture.md).
+`Content-Length` is the number of body bytes. An unknown path is 404. A known path with another method is 405. A malformed request receives an error status such as 400, 413, 431, 501, or 505. Two clients can be served at the same time. Past 100 open connections, further clients wait in the listen queue until one finishes. See [docs/architecture.md](docs/architecture.md).
 
 The small REST API is `examples/rest-api`:
 
@@ -38,7 +38,7 @@ go run ./cmd/forgehttp
 go run ./cmd/forgehttp -addr 127.0.0.1:8080
 ```
 
-Ctrl+C closes the listener and the active connection.
+Ctrl+C closes the listener and every open connection.
 
 ## Try it
 
@@ -64,7 +64,7 @@ $reader.ReadToEnd()
 $client.Close()
 ```
 
-Close one client before the next. The accept loop serves one connection to completion.
+Several clients can be connected at once. Each connection is still one request, then `Connection: close`.
 
 ## Test
 

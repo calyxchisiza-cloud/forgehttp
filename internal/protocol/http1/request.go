@@ -1,5 +1,5 @@
-// Package http1 reads HTTP/1.x requests from a byte stream.
-// It does not write responses and it does not use net/http.
+// Package http1 reads and writes HTTP/1 messages.
+// It does not use net/http.
 package http1
 
 import "errors"

@@ -23,12 +23,9 @@ func TestTwoClientsSequentially(t *testing.T) {
 	defer stop()
 
 	first := roundTrip(t, addr, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n")
-	if !strings.Contains(first, "GET /a HTTP/1.1\n") {
-		t.Fatalf("first body %q", first)
-	}
 	second := roundTrip(t, addr, "POST /b HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nxyz")
-	if !strings.Contains(second, "POST /b HTTP/1.1\n") || !strings.HasSuffix(second, "\nxyz") {
-		t.Fatalf("second body %q", second)
+	if first != http1.HelloMessage || second != http1.HelloMessage {
+		t.Fatalf("bodies %q and %q", first, second)
 	}
 }
 
@@ -79,7 +76,7 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	}
 	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
 	body := readResponseBody(t, second)
-	if !strings.Contains(body, "GET /ready HTTP/1.1\n") {
+	if body != http1.HelloMessage {
 		t.Fatalf("second body %q", body)
 	}
 }
@@ -101,8 +98,8 @@ func TestFragmentedRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 	body := readResponseBody(t, conn)
-	if !strings.Contains(body, "GET /hello HTTP/1.1\n") || !strings.Contains(body, "Host: localhost\n") {
-		t.Fatalf("body %q", body)
+	if body != http1.HelloMessage || len(body) != 34 {
+		t.Fatalf("body %q (%d bytes)", body, len(body))
 	}
 }
 
@@ -125,10 +122,9 @@ func TestOversizedRequestLineClosesConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 8)
-	n, err := conn.Read(buf)
-	if n != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("read %d bytes, err %v; want EOF", n, err)
+	status, body, n := readResponse(t, conn)
+	if status != "HTTP/1.1 431 Request Header Fields Too Large\r\n" || body != "headers too large" || n != len(body) {
+		t.Fatalf("status %q body %q length %d", status, body, n)
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for !strings.Contains(logBuf.String(), "request line exceeds maximum size") {
@@ -136,6 +132,23 @@ func TestOversizedRequestLineClosesConnection(t *testing.T) {
 			t.Fatalf("log %q", logBuf.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestBadRequestAndChunkedGetErrorResponses(t *testing.T) {
+	addr, stop := startServer(t, &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
+	defer stop()
+
+	missingHost := roundTripStatus(t, addr, "GET / HTTP/1.1\r\n\r\n")
+	if missingHost.status != "HTTP/1.1 400 Bad Request\r\n" || missingHost.body != "bad request" {
+		t.Fatalf("missing host %#v", missingHost)
+	}
+	chunked := roundTripStatus(t, addr, "POST / HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")
+	if chunked.status != "HTTP/1.1 501 Not Implemented\r\n" || chunked.body != "transfer encoding not implemented" {
+		t.Fatalf("chunked %#v", chunked)
+	}
+	if strings.Contains(chunked.body, "hello") {
+		t.Fatalf("chunked body was echoed: %q", chunked.body)
 	}
 }
 
@@ -253,7 +266,17 @@ func startServer(t *testing.T, srv *Server) (string, func()) {
 	return ln.Addr().String(), stop
 }
 
+type httpResult struct {
+	status string
+	body   string
+}
+
 func roundTrip(t *testing.T, addr, raw string) string {
+	t.Helper()
+	return roundTripStatus(t, addr, raw).body
+}
+
+func roundTripStatus(t *testing.T, addr, raw string) httpResult {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -264,20 +287,27 @@ func roundTrip(t *testing.T, addr, raw string) string {
 	if _, err := conn.Write([]byte(raw)); err != nil {
 		t.Fatal(err)
 	}
-	return readResponseBody(t, conn)
+	status, body, _ := readResponse(t, conn)
+	return httpResult{status: status, body: body}
 }
 
 func readResponseBody(t *testing.T, r io.Reader) string {
 	t.Helper()
+	status, body, n := readResponse(t, r)
+	if status != "HTTP/1.1 200 OK\r\n" || n != len(body) {
+		t.Fatalf("status %q body %q length %d", status, body, n)
+	}
+	return body
+}
+
+func readResponse(t *testing.T, r io.Reader) (status, body string, contentLength int) {
+	t.Helper()
 	br := bufio.NewReader(r)
-	status, err := br.ReadString('\n')
+	var err error
+	status, err = br.ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
 	}
-	if status != "HTTP/1.1 200 OK\r\n" {
-		t.Fatalf("status %q", status)
-	}
-	var contentLength int
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
@@ -297,7 +327,7 @@ func readResponseBody(t *testing.T, r io.Reader) string {
 	if _, err := io.ReadFull(br, buf); err != nil {
 		t.Fatal(err)
 	}
-	return string(buf)
+	return status, string(buf), contentLength
 }
 
 func isTimeout(err error) bool {

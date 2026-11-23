@@ -1,19 +1,19 @@
 # ForgeHTTP architecture
 
-Milestone 01 implements the TCP listener and a one-line connection exchange. The other components are named here so later milestones have a place to land. They are not in this tree yet.
+Phase 1 accepts one TCP connection at a time and shuts down on context cancellation. Phase 2 parses one HTTP/1 request from that connection.
 
 ## Components
 
-| Component | Responsibility | Milestone 01 |
+| Component | Responsibility | Now |
 | --- | --- | --- |
 | TCP listener | Bind a TCP socket and accept connections | `transport.Listen`, `server.ListenAndServe` |
 | Connection manager | Deadlines, the active connection, shutdown | One connection at a time, deadlines, context shutdown |
-| HTTP parser | Request line, headers, body, framing | Later. `Exchange` reads one raw line |
-| Request handler | Validate a parsed request | Later |
+| HTTP parser | Request line, headers, body, framing | `http1.ReadRequest` |
+| Request handler | Validate a parsed request beyond framing | Later |
 | Router | Method and path to application logic | Later |
-| Response writer | Status, headers, body, `Content-Length` | Later. `Exchange` writes one raw line |
+| Response writer | Status, headers, body, `Content-Length` | Later. The server writes a plain-text dump of the parse so a client can finish |
 
-`transport` knows sockets and the line protocol. `server` knows the accept loop and shutdown. Neither package imports an HTTP type. `net/http` is not part of this server.
+`transport` opens sockets. `protocol/http1` reads requests. `server` owns the accept loop, deadlines, and shutdown. `net/http` is not part of this server.
 
 ## Process
 
@@ -26,23 +26,29 @@ ListenAndServe
   net.Listen("tcp", 127.0.0.1:8080)
         |
         v
-Accept  ---- one connection ---- Exchange ---- Close
-  ^                                            |
-  +--------------------------------------------+
+Accept ---- one connection ---- ReadRequest ---- parse dump ---- Close
+  ^                                                                |
+  +----------------------------------------------------------------+
 ```
 
-A client that has not finished its line is served before the next accepted client. Concurrent serving is a later milestone. The accept loop is the place that change lands. `Exchange` is the place an HTTP parser replaces the line protocol.
+A client that has not finished its request is served before the next accepted client. Concurrent serving is a later phase. The accept loop is the place that change lands.
 
-## Policies already fixed
+## Parser rules
 
-These apply when the HTTP milestones arrive. They are recorded now so the TCP server does not grow a parser that contradicts them.
+- The request line is `METHOD SP target SP HTTP/1.0` or `HTTP/1.1`, ended by CRLF. The line is at most 8 KiB, including CRLF.
+- The target is an origin-form path (`/hello?x=1`) or `*`.
+- Header names are tokens and are stored in canonical form (`content-length` becomes `Content-Length`). Repeated fields stay as a list.
+- The header block ends at a blank line and is at most 32 KiB.
+- HTTP/1.1 requires exactly one Host field.
+- A body is read only from a single `Content-Length`. The maximum body is 1 MB. A larger length is rejected before the body is read.
+- Any `Transfer-Encoding` is rejected. If `Transfer-Encoding` and `Content-Length` are both present, the request is rejected as ambiguous framing. The body bytes are left unread.
+- More than one `Content-Length` is ambiguous framing.
 
-- Request line limit: 8 KiB. The Milestone 01 message limit is the same number, applied to one raw line.
-- Headers: 32 KiB maximum, when header parsing exists.
-- Request body: 1 MB maximum, when body reading exists.
+## Still fixed for later phases
+
 - Concurrent connections: 100, when the server accepts concurrently.
-- Idle timeout: 30 seconds. Milestone 01 uses 30 seconds as the read deadline on the one active connection.
-- Chunked transfer encoding is unsupported until a chunked decoder exists. A chunked body must not be read as a `Content-Length` body.
+- Idle timeout: 30 seconds. The server uses 30 seconds as the read deadline on the one active connection.
+- Chunked transfer encoding stays unsupported until a chunked decoder exists.
 - The sample body `{"message":"Hello from ForgeHTTP"}` is 34 bytes. A later response that sends it must use `Content-Length: 34`.
 
 ## Shutdown

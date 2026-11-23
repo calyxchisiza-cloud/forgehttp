@@ -1,6 +1,6 @@
 # ForgeHTTP architecture
 
-Phase 1 accepts one TCP connection at a time and shuts down on context cancellation. Phase 2 parses one HTTP/1 request from that connection.
+Phase 1 accepts one TCP connection at a time and shuts down on context cancellation. Phase 2 parses one HTTP/1 request from that connection. Phase 3 serializes an HTTP/1.1 response.
 
 ## Components
 
@@ -11,9 +11,9 @@ Phase 1 accepts one TCP connection at a time and shuts down on context cancellat
 | HTTP parser | Request line, headers, body, framing | `http1.ReadRequest` |
 | Request handler | Validate a parsed request beyond framing | Later |
 | Router | Method and path to application logic | Later |
-| Response writer | Status, headers, body, `Content-Length` | Later. The server writes a plain-text dump of the parse so a client can finish |
+| Response writer | Status, headers, body, `Content-Length` | `Response.Write` |
 
-`transport` opens sockets. `protocol/http1` reads requests. `server` owns the accept loop, deadlines, and shutdown. `net/http` is not part of this server.
+`transport` opens sockets. `protocol/http1` reads requests and writes responses. `server` owns the accept loop, deadlines, and shutdown. `net/http` is not part of this server.
 
 ## Process
 
@@ -26,7 +26,7 @@ ListenAndServe
   net.Listen("tcp", 127.0.0.1:8080)
         |
         v
-Accept ---- one connection ---- ReadRequest ---- parse dump ---- Close
+Accept ---- one connection ---- ReadRequest ---- Response.Write ---- Close
   ^                                                                |
   +----------------------------------------------------------------+
 ```
@@ -49,7 +49,15 @@ A client that has not finished its request is served before the next accepted cl
 - Concurrent connections: 100, when the server accepts concurrently.
 - Idle timeout: 30 seconds. The server uses 30 seconds as the read deadline on the one active connection.
 - Chunked transfer encoding stays unsupported until a chunked decoder exists.
-- The sample body `{"message":"Hello from ForgeHTTP"}` is 34 bytes. A later response that sends it must use `Content-Length: 34`.
+- `{"message":"Hello from ForgeHTTP"}` is 34 bytes. The phase 3 response sends `Content-Length: 34`.
+
+## Response rules
+
+- The status line is `HTTP/1.1`, a code from 100 to 599, and a fixed reason phrase.
+- `Content-Length` is `len(Body)`. A length supplied by the caller is not written.
+- `Connection` is `close`.
+- `Transfer-Encoding` is rejected.
+- Header names must be tokens. Header values must not contain CR, LF, or other control characters, so a value cannot start another header.
 
 ## Shutdown
 

@@ -4,14 +4,11 @@ package server
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"log"
 	"net"
-	"slices"
 	"sync"
 	"time"
 
@@ -29,7 +26,7 @@ type Server struct {
 	// Zero uses 30 seconds.
 	ReadTimeout time.Duration
 
-	// WriteTimeout bounds how long the parse summary may take to leave.
+	// WriteTimeout bounds how long the response may take to leave.
 	// Zero uses 10 seconds.
 	WriteTimeout time.Duration
 
@@ -112,17 +109,40 @@ func (s *Server) serve(conn net.Conn) {
 		return
 	}
 	req, err := http1.ReadRequest(bufio.NewReader(conn), s.Limits)
+	var resp *http1.Response
 	if err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
-		return
+		if errors.Is(err, io.EOF) {
+			return
+		}
+		resp = errorResponse(err)
+	} else {
+		s.logger().Printf("%s %s %s", req.Method, req.Target, conn.RemoteAddr())
+		resp = http1.JSON(200, []byte(http1.HelloMessage))
 	}
-	s.logger().Printf("%s %s %s", req.Method, req.Target, conn.RemoteAddr())
 	if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout())); err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
 		return
 	}
-	if err := writeParseSummary(conn, req); err != nil {
+	if err := resp.Write(conn); err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+	}
+}
+
+func errorResponse(err error) *http1.Response {
+	switch {
+	case errors.Is(err, http1.ErrRequestLineTooLarge), errors.Is(err, http1.ErrHeadersTooLarge):
+		return http1.Text(431, "headers too large")
+	case errors.Is(err, http1.ErrBodyTooLarge):
+		return http1.Text(413, "body too large")
+	case errors.Is(err, http1.ErrBadVersion):
+		return http1.Text(505, "unsupported HTTP version")
+	case errors.Is(err, http1.ErrUnsupportedTransferEncoding):
+		return http1.Text(501, "transfer encoding not implemented")
+	case errors.Is(err, http1.ErrAmbiguousFraming):
+		return http1.Text(400, "ambiguous message framing")
+	default:
+		return http1.Text(400, "bad request")
 	}
 }
 
@@ -138,47 +158,6 @@ func (s *Server) writeTimeout() time.Duration {
 		return s.WriteTimeout
 	}
 	return 10 * time.Second
-}
-
-// writeParseSummary sends the parsed request as plain text.
-// It is a debug dump so a client can finish the exchange. The response writer is a later phase.
-func writeParseSummary(w io.Writer, req *http1.Request) error {
-	var payload bytes.Buffer
-	fmt.Fprintf(&payload, "%s %s %s\n", req.Method, req.Target, req.Proto)
-	names := make([]string, 0, len(req.Header))
-	for name := range req.Header {
-		names = append(names, name)
-	}
-	slices.Sort(names)
-	for _, name := range names {
-		for _, value := range req.Header[name] {
-			fmt.Fprintf(&payload, "%s: %s\n", name, value)
-		}
-	}
-	if len(req.Body) > 0 {
-		payload.WriteByte('\n')
-		payload.Write(req.Body)
-	}
-	var head bytes.Buffer
-	fmt.Fprintf(&head, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", payload.Len())
-	if err := writeAll(w, head.Bytes()); err != nil {
-		return err
-	}
-	return writeAll(w, payload.Bytes())
-}
-
-func writeAll(w io.Writer, p []byte) error {
-	for len(p) > 0 {
-		n, err := w.Write(p)
-		p = p[n:]
-		if err != nil {
-			return err
-		}
-		if n == 0 {
-			return io.ErrShortWrite
-		}
-	}
-	return nil
 }
 
 func (s *Server) beginShutdown(ln net.Listener) {

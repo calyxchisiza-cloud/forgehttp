@@ -1,8 +1,17 @@
 # ForgeHTTP
 
-Phase 2 reads HTTP/1 requests. The server still accepts one TCP connection at a time on `127.0.0.1:8080`. For each connection it parses one request and writes a plain-text dump of that parse, then closes.
+Phase 3 writes HTTP/1.1 responses. The server still accepts one TCP connection at a time on `127.0.0.1:8080`. A valid request receives:
 
-The dump is there so `curl` and a browser can finish the exchange. The response writer, routing, and a goroutine per connection are later phases. See [docs/architecture.md](docs/architecture.md).
+```
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 34
+Connection: close
+
+{"message":"Hello from ForgeHTTP"}
+```
+
+`Content-Length` is the number of body bytes. A malformed request receives an error status such as 400, 413, 431, 501, or 505. Routing and a goroutine per connection are later phases. See [docs/architecture.md](docs/architecture.md).
 
 A request line is limited to 8 KiB, the header block to 32 KiB, and a `Content-Length` body to 1 MB. `Transfer-Encoding` is rejected and its body is not read. A chunked body is never treated as a `Content-Length` body.
 
@@ -24,13 +33,7 @@ Ctrl+C closes the listener and the active connection.
 curl -v http://127.0.0.1:8080/hello
 ```
 
-The body is the parsed request:
-
-```
-GET /hello HTTP/1.1
-Host: 127.0.0.1:8080
-...
-```
+The body is `{"message":"Hello from ForgeHTTP"}`.
 
 A raw client can send the bytes itself:
 

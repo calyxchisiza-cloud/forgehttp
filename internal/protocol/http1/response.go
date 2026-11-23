@@ -9,10 +9,12 @@ import (
 const HelloMessage = `{"message":"Hello from ForgeHTTP"}`
 
 // Response is one HTTP/1.1 response. Content-Length is computed from Body when the response is written.
+// Persist selects Connection: keep-alive. The zero value sends Connection: close.
 type Response struct {
-	Status int
-	Header Header
-	Body   []byte
+	Status  int
+	Header  Header
+	Body    []byte
+	Persist bool
 }
 
 var (

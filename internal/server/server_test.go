@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"errors"
 	"io"
 	"log"
 	"net"
@@ -205,6 +204,208 @@ func TestHandlersOverlapAndKeepSharedState(t *testing.T) {
 	}
 }
 
+func TestRequestsOnOneConnectionStayInOrder(t *testing.T) {
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second}
+	registerText(t, srv, "GET", "/one", "one")
+	registerText(t, srv, "GET", "/two", "two")
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	raw := "GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n" +
+		"GET /two HTTP/1.1\r\nHost: localhost\r\n\r\n"
+	if _, err := conn.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	status, connection, body := readMessage(t, conn)
+	if status != "HTTP/1.1 200 OK\r\n" || connection != "keep-alive" || body != "one" {
+		t.Fatalf("first status %q connection %q body %q", status, connection, body)
+	}
+	status, connection, body = readMessage(t, conn)
+	if status != "HTTP/1.1 200 OK\r\n" || connection != "keep-alive" || body != "two" {
+		t.Fatalf("second status %q connection %q body %q", status, connection, body)
+	}
+}
+
+func TestHTTP10ClosesUnlessKeepAlive(t *testing.T) {
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second}
+	registerText(t, srv, "GET", "/one", "one")
+	registerText(t, srv, "GET", "/two", "two")
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	closed, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closed.Close()
+	_ = closed.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := closed.Write([]byte("GET /one HTTP/1.0\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_, connection, body := readMessage(t, closed)
+	if connection != "close" || body != "one" {
+		t.Fatalf("HTTP/1.0 connection %q body %q", connection, body)
+	}
+	_ = closed.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := closed.Read(make([]byte, 8)); err == nil || isTimeout(err) {
+		t.Fatalf("HTTP/1.0 connection stayed open: %d %v", n, err)
+	}
+
+	kept, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer kept.Close()
+	_ = kept.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := kept.Write([]byte("GET /one HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_, connection, body = readMessage(t, kept)
+	if connection != "keep-alive" || body != "one" {
+		t.Fatalf("HTTP/1.0 keep-alive connection %q body %q", connection, body)
+	}
+	if _, err := kept.Write([]byte("GET /two HTTP/1.0\r\nConnection: keep-alive\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	_, connection, body = readMessage(t, kept)
+	if connection != "keep-alive" || body != "two" {
+		t.Fatalf("second HTTP/1.0 connection %q body %q", connection, body)
+	}
+}
+
+func TestConnectionCloseEndsTheConnection(t *testing.T) {
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second}
+	registerText(t, srv, "GET", "/one", "one")
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	raw := "GET /one HTTP/1.1\r\nHost: localhost\r\nConnection: keep-alive, close\r\n\r\n"
+	if _, err := conn.Write([]byte(raw)); err != nil {
+		t.Fatal(err)
+	}
+	_, connection, body := readMessage(t, conn)
+	if connection != "close" || body != "one" {
+		t.Fatalf("connection %q body %q", connection, body)
+	}
+	_ = conn.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, err := conn.Read(make([]byte, 8)); err == nil || isTimeout(err) {
+		t.Fatalf("connection stayed open after Connection: close: %d %v", n, err)
+	}
+}
+
+func TestIdleTimeoutClosesQuietly(t *testing.T) {
+	srv := &Server{
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		IdleTimeout:  200 * time.Millisecond,
+	}
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	if n, err := conn.Read(make([]byte, 8)); err == nil || isTimeout(err) {
+		t.Fatalf("idle connection was not closed: %d %v", n, err)
+	}
+}
+
+func TestSlowRequestTimesOut(t *testing.T) {
+	srv := &Server{
+		ReadTimeout:  200 * time.Millisecond,
+		WriteTimeout: 2 * time.Second,
+		IdleTimeout:  2 * time.Second,
+	}
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("GET /")); err != nil {
+		t.Fatal(err)
+	}
+	status, connection, body := readMessage(t, conn)
+	if status != "HTTP/1.1 408 Request Timeout\r\n" || connection != "close" || body != "request timeout" {
+		t.Fatalf("status %q connection %q body %q", status, connection, body)
+	}
+}
+
+func TestShutdownFinishesCurrentResponse(t *testing.T) {
+	ln, err := transport.Listen("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	srv := &Server{
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		IdleTimeout:  2 * time.Second,
+		Logger:       log.New(io.Discard, "", 0),
+	}
+	if err := srv.Handle("GET", "/hold", func(*http1.Request) *http1.Response {
+		close(started)
+		<-release
+		return http1.Text(200, "done")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- srv.Serve(ctx, ln)
+	}()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("GET /hold HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler did not start")
+	}
+	cancel()
+	close(release)
+	status, connection, body := readMessage(t, conn)
+	if status != "HTTP/1.1 200 OK\r\n" || connection != "close" || body != "done" {
+		t.Fatalf("status %q connection %q body %q", status, connection, body)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Serve returned %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("shutdown did not finish the in-flight response")
+	}
+}
+
 func TestFragmentedRequest(t *testing.T) {
 	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
 	registerHello(t, srv)
@@ -390,6 +591,15 @@ func TestListenAndServeCancel(t *testing.T) {
 	}
 }
 
+func registerText(t *testing.T, srv *Server, method, path, body string) {
+	t.Helper()
+	if err := srv.Handle(method, path, func(*http1.Request) *http1.Response {
+		return http1.Text(200, body)
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func registerHello(t *testing.T, srv *Server) {
 	t.Helper()
 	h := func(*http1.Request) *http1.Response {
@@ -457,6 +667,41 @@ func roundTripStatus(t *testing.T, addr, raw string) httpResult {
 	return httpResult{status: status, body: body}
 }
 
+func readMessage(t *testing.T, r io.Reader) (status, connection, body string) {
+	t.Helper()
+	br := bufio.NewReader(r)
+	var err error
+	status, err = br.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	var contentLength int
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+		if strings.HasPrefix(line, "Content-Length: ") {
+			contentLength, err = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Content-Length: ")))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if strings.HasPrefix(line, "Connection: ") {
+			connection = strings.TrimSpace(strings.TrimPrefix(line, "Connection: "))
+			connection = strings.TrimSuffix(connection, "\r")
+		}
+	}
+	buf := make([]byte, contentLength)
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatal(err)
+	}
+	return status, connection, string(buf)
+}
+
 func readResponseBody(t *testing.T, r io.Reader) string {
 	t.Helper()
 	status, body, n := readResponse(t, r)
@@ -501,11 +746,6 @@ func readResponseErr(r io.Reader) (status, body string, contentLength int, err e
 		return "", "", 0, err
 	}
 	return status, string(buf), contentLength, nil
-}
-
-func isTimeout(err error) bool {
-	var ne net.Error
-	return errors.As(err, &ne) && ne.Timeout()
 }
 
 func waitListenAddr(t *testing.T, buf *lockedBuffer) string {

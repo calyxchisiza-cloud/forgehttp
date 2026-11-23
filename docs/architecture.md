@@ -1,13 +1,13 @@
 # ForgeHTTP architecture
 
-Phase 1 accepted one TCP connection at a time. Phase 2 parses one HTTP/1 request. Phase 3 serializes an HTTP/1.1 response. Phase 4 routes that request by exact method and path. Phase 5 serves each connection on its own goroutine, up to 100 at once.
+Phase 1 accepted one TCP connection at a time. Phase 2 parses one HTTP/1 request. Phase 3 serializes an HTTP/1.1 response. Phase 4 routes that request by exact method and path. Phase 5 serves each connection on its own goroutine, up to 100 at once. Phase 6 reads another request on that connection after the response, and shuts down without dropping a response already started.
 
 ## Components
 
 | Component | Responsibility | Now |
 | --- | --- | --- |
 | TCP listener | Bind a TCP socket and accept connections | `transport.Listen`, `server.ListenAndServe` |
-| Connection manager | Deadlines, open connections, the connection limit, shutdown | One goroutine per connection, limit 100, context shutdown |
+| Connection manager | Deadlines, open connections, the connection limit, keep-alive, shutdown | One goroutine per connection, limit 100, idle timeout, graceful shutdown |
 | HTTP parser | Request line, headers, body, framing | `http1.ReadRequest` |
 | Request handler | Validate a parsed request beyond framing | Later |
 | Router | Method and path to application logic | `router.Router`, exact paths only |
@@ -26,12 +26,17 @@ ListenAndServe
   net.Listen("tcp", 127.0.0.1:8080)
         |
         v
-Accept -- slot available -- goroutine -- ReadRequest -- Router -- Response.Write -- Close
-  ^                                                                              |
-  +------------------------------------------------------------------------------+
+Accept -- slot available -- goroutine -- ReadRequest -- Router -- Response.Write --+
+  ^                                         ^                                        |
+  |                                         +----------------------------------------+
+  +----------------------------------------------------------------------------------+
 ```
 
-The accept loop takes one slot from a limit of 100 before `Accept`. That slot stays with the connection goroutine until the connection closes. At the limit, `Accept` waits, and further clients remain in the kernel listen queue. That is the backpressure. A connection reads one request, writes one response, and closes. It does not pipeline another response ahead of that write. Handlers that share data must synchronize it themselves. The user store in `examples/rest-api` does that with a mutex.
+The accept loop takes one slot from a limit of 100 before `Accept`. That slot stays with the connection goroutine until the connection closes. At the limit, `Accept` waits, and further clients remain in the kernel listen queue. That is the backpressure.
+
+The connection goroutine then waits for another request. HTTP/1.1 is kept alive unless the request includes `Connection: close`. HTTP/1.0 is closed unless the request includes `Connection: keep-alive`. If both tokens are present, the connection closes. The next request is read only after the current response is written.
+
+The idle timeout is 30 seconds and applies until the first byte of a request. After that byte, the read deadline bounds the rest of the request. A read deadline that fires while a request is incomplete is answered with 408, then the connection closes. A parse error also closes the connection. Handlers that share data must synchronize it themselves. The user store in `examples/rest-api` does that with a mutex.
 
 ## Parser rules
 
@@ -46,8 +51,6 @@ The accept loop takes one slot from a limit of 100 before `Accept`. That slot st
 
 ## Still fixed for later phases
 
-- Idle timeout on a kept-alive connection. The read deadline is still 30 seconds for the one request on a connection.
-- Keep-alive and more than one request per connection.
 - Chunked transfer encoding stays unsupported until a chunked decoder exists.
 - `{"message":"Hello from ForgeHTTP"}` is 34 bytes. The phase 3 response sends `Content-Length: 34`.
 
@@ -63,12 +66,12 @@ The accept loop takes one slot from a limit of 100 before `Accept`. That slot st
 
 - The status line is `HTTP/1.1`, a code from 100 to 599, and a fixed reason phrase.
 - `Content-Length` is `len(Body)`. A length supplied by the caller is not written.
-- `Connection` is `close`.
+- `Connection` is `keep-alive` when the server sets `Persist`, and `close` otherwise. A connection value supplied by the caller is not written.
 - `Transfer-Encoding` is rejected.
 - Header names must be tokens. Header values must not contain CR, LF, or other control characters, so a value cannot start another header.
 
 ## Shutdown
 
-Cancelling the context closes the listener and every open connection. `Accept` and a blocked `Read` return. `ListenAndServe` waits for the connection goroutines and then returns nil. Closing an already-closed listener or connection is ignored.
+Cancelling the context closes the listener and every connection that is waiting for a request. `Accept` and that idle read return. A connection that already has a complete request finishes writing its response, with `Connection: close`, and then closes. `ListenAndServe` waits for those goroutines and then returns nil. Closing an already-closed listener or connection is ignored.
 
 A temporary `Accept` error is logged and the loop continues. Any other `Accept` error stops the server.

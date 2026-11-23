@@ -8,7 +8,8 @@ import (
 )
 
 // Write serializes the response to w.
-// Content-Length is the length of Body. Connection is close.
+// Content-Length is the length of Body.
+// Persist sends Connection: keep-alive. Otherwise Connection is close.
 // A caller-supplied Content-Length or Connection field is not sent.
 // Transfer-Encoding is rejected. Header names and values are checked so a value cannot inject another header.
 func (r *Response) Write(w io.Writer) error {
@@ -44,7 +45,11 @@ func (r *Response) Write(w io.Writer) error {
 			fmt.Fprintf(&buf, "%s: %s\r\n", name, value)
 		}
 	}
-	fmt.Fprintf(&buf, "Connection: close\r\nContent-Length: %d\r\n\r\n", len(r.Body))
+	connection := "close"
+	if r.Persist {
+		connection = "keep-alive"
+	}
+	fmt.Fprintf(&buf, "Connection: %s\r\nContent-Length: %d\r\n\r\n", connection, len(r.Body))
 	buf.Write(r.Body)
 	return writeAll(w, buf.Bytes())
 }

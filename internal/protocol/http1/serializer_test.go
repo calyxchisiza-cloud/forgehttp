@@ -50,6 +50,25 @@ func TestWriteErrorResponse(t *testing.T) {
 	}
 }
 
+func TestWriteKeepAliveIgnoresCallerConnection(t *testing.T) {
+	var buf bytes.Buffer
+	resp := Text(200, "hi")
+	resp.Persist = true
+	resp.Header["Connection"] = []string{"close"}
+	if err := resp.Write(&buf); err != nil {
+		t.Fatal(err)
+	}
+	const want = "HTTP/1.1 200 OK\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"Connection: keep-alive\r\n" +
+		"Content-Length: 2\r\n" +
+		"\r\n" +
+		"hi"
+	if buf.String() != want {
+		t.Fatalf("serialized\n%q", buf.String())
+	}
+}
+
 func TestWriteRejectsHeaderInjection(t *testing.T) {
 	cases := []struct {
 		name  string

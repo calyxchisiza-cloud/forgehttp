@@ -1,5 +1,7 @@
 // Package server accepts TCP connections and serves each one on its own
-// goroutine. Cancelling the context closes the listener and every connection.
+// goroutine. A connection can carry more than one request, in order.
+// Cancelling the context stops Accept, finishes a response already started,
+// and closes connections that are still waiting for a request.
 package server
 
 import (
@@ -9,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,9 +23,22 @@ import (
 // defaultMaxConns is the connection limit when MaxConns is zero.
 const defaultMaxConns = 100
 
+// defaultIdleTimeout is how long a connection may wait for the next request.
+const defaultIdleTimeout = 30 * time.Second
+
+// connStage is what a connection is doing. Shutdown closes a connection that
+// is still reading. A connection that is already handling a request is left
+// open until that response is written.
+type connStage int
+
+const (
+	stageReading connStage = iota
+	stageServing
+)
+
 // Server accepts connections and serves each one on its own goroutine.
-// A connection handles one request, then closes. Requests on one connection
-// stay in order because that goroutine does not pipeline them.
+// The goroutine reads a request, writes the response, then reads the next
+// request on that connection. It does not write the next response first.
 type Server struct {
 	// Addr is the host:port to bind. Empty means 127.0.0.1:8080.
 	Addr string
@@ -34,6 +50,11 @@ type Server struct {
 	// WriteTimeout bounds how long the response may take to leave.
 	// Zero uses 10 seconds.
 	WriteTimeout time.Duration
+
+	// IdleTimeout bounds how long a connection may wait for the first byte
+	// of the next request. Zero uses 30 seconds. Once a byte arrives,
+	// ReadTimeout bounds the rest of that request.
+	IdleTimeout time.Duration
 
 	// MaxConns is how many connections may be served at once.
 	// Zero uses 100. At the limit, Accept waits and further clients stay in
@@ -55,7 +76,7 @@ type Server struct {
 
 	mu      sync.Mutex
 	closing bool
-	conns   map[net.Conn]struct{}
+	conns   map[net.Conn]connStage
 	slots   chan struct{}
 	wg      sync.WaitGroup
 }
@@ -94,7 +115,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 
 	s.mu.Lock()
-	s.conns = make(map[net.Conn]struct{})
+	s.conns = make(map[net.Conn]connStage)
 	s.slots = make(chan struct{}, s.maxConns())
 	s.mu.Unlock()
 
@@ -150,30 +171,69 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	if s.onAccepted != nil {
 		s.onAccepted(conn)
 	}
-	if err := conn.SetReadDeadline(time.Now().Add(s.readTimeout())); err != nil {
-		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
-		return
-	}
-	req, err := http1.ReadRequest(bufio.NewReader(conn), s.Limits)
-	var resp *http1.Response
-	if err != nil {
-		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
-		if errors.Is(err, io.EOF) {
+
+	reader := bufio.NewReader(conn)
+	for {
+		if s.isClosing() {
 			return
 		}
-		resp = errorResponse(err)
-	} else {
+		// Idle wait: no bytes yet. A timeout or a client close ends the connection
+		// without a response. Shutdown closes the socket, which unblocks Peek.
+		if err := conn.SetReadDeadline(time.Now().Add(s.idleTimeout())); err != nil {
+			s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+			return
+		}
+		if _, err := reader.Peek(1); err != nil {
+			if !errors.Is(err, io.EOF) {
+				s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+			}
+			return
+		}
+		if err := conn.SetReadDeadline(time.Now().Add(s.readTimeout())); err != nil {
+			s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+			return
+		}
+		req, err := http1.ReadRequest(reader, s.Limits)
+		if err != nil {
+			s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			resp := errorResponse(err)
+			if isTimeout(err) {
+				resp = http1.Text(408, "request timeout")
+			}
+			_ = s.writeResponse(conn, resp)
+			return
+		}
+
+		// The request is complete. Shutdown must not close this socket until
+		// the response below has been written.
+		s.markStage(conn, stageServing)
 		s.logger().Printf("%s %s %s", req.Method, req.Target, conn.RemoteAddr())
 		req.SetContext(ctx)
-		resp = s.router().Serve(req)
+		resp := s.router().Serve(req)
+		resp.Persist = keepAlive(req) && ctx.Err() == nil && !s.isClosing()
+		if err := s.writeResponse(conn, resp); err != nil {
+			return
+		}
+		if !resp.Persist {
+			return
+		}
+		s.markStage(conn, stageReading)
 	}
+}
+
+func (s *Server) writeResponse(conn net.Conn, resp *http1.Response) error {
 	if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout())); err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
-		return
+		return err
 	}
 	if err := resp.Write(conn); err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
+		return err
 	}
+	return nil
 }
 
 func errorResponse(err error) *http1.Response {
@@ -222,6 +282,13 @@ func (s *Server) releaseSlot() {
 	<-s.slots
 }
 
+func (s *Server) idleTimeout() time.Duration {
+	if s.IdleTimeout > 0 {
+		return s.IdleTimeout
+	}
+	return defaultIdleTimeout
+}
+
 func (s *Server) readTimeout() time.Duration {
 	if s.ReadTimeout > 0 {
 		return s.ReadTimeout
@@ -239,16 +306,20 @@ func (s *Server) writeTimeout() time.Duration {
 func (s *Server) beginShutdown(ln net.Listener) {
 	s.mu.Lock()
 	s.closing = true
-	conns := make([]net.Conn, 0, len(s.conns))
-	for conn := range s.conns {
-		conns = append(conns, conn)
+	var waiting []net.Conn
+	for conn, stage := range s.conns {
+		if stage == stageReading {
+			waiting = append(waiting, conn)
+		}
 	}
 	s.mu.Unlock()
 
-	// Accept and a blocked Read both have to wake up. Closing the listener
-	// unblocks Accept. Closing every connection unblocks its Read.
+	// Accept and a blocked idle read both have to wake up. Closing the listener
+	// unblocks Accept. Closing a connection that is still waiting for a request
+	// unblocks its read. A connection already handling a request stays open
+	// until that response is written.
 	_ = ln.Close()
-	for _, conn := range conns {
+	for _, conn := range waiting {
 		_ = conn.Close()
 	}
 }
@@ -259,8 +330,16 @@ func (s *Server) track(conn net.Conn) bool {
 	if s.closing {
 		return false
 	}
-	s.conns[conn] = struct{}{}
+	s.conns[conn] = stageReading
 	return true
+}
+
+func (s *Server) markStage(conn net.Conn, stage connStage) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.conns[conn]; ok {
+		s.conns[conn] = stage
+	}
 }
 
 func (s *Server) untrack(conn net.Conn) {
@@ -285,4 +364,37 @@ func (s *Server) logger() *log.Logger {
 func isTemporary(err error) bool {
 	var ne net.Error
 	return errors.As(err, &ne) && ne.Temporary()
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// keepAlive reports whether the connection can carry another request.
+// HTTP/1.1 stays open unless the client sent Connection: close.
+// HTTP/1.0 stays open only when the client sent Connection: keep-alive.
+// close wins when both tokens are present.
+func keepAlive(req *http1.Request) bool {
+	if req == nil {
+		return false
+	}
+	var closeTok, keepTok bool
+	for _, value := range req.Header.Values("Connection") {
+		for _, part := range strings.Split(value, ",") {
+			switch strings.ToLower(strings.TrimSpace(part)) {
+			case "close":
+				closeTok = true
+			case "keep-alive":
+				keepTok = true
+			}
+		}
+	}
+	if closeTok {
+		return false
+	}
+	if req.Proto == "HTTP/1.0" {
+		return keepTok
+	}
+	return req.Proto == "HTTP/1.1"
 }

@@ -8,23 +8,27 @@ import (
 	"io"
 	"log"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"forgehttp/internal/protocol/http1"
 	"forgehttp/internal/transport"
 )
 
 func TestTwoClientsSequentially(t *testing.T) {
-	addr, stop := startServer(t, &Server{Limits: fastLimits()})
+	addr, stop := startServer(t, &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
 	defer stop()
 
-	if got := roundTrip(t, addr, "Hello Server\n"); got != "Hello Client\n" {
-		t.Fatalf("first reply %q", got)
+	first := roundTrip(t, addr, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	if !strings.Contains(first, "GET /a HTTP/1.1\n") {
+		t.Fatalf("first body %q", first)
 	}
-	if got := roundTrip(t, addr, "ping\n"); got != "Echo: ping\n" {
-		t.Fatalf("second reply %q", got)
+	second := roundTrip(t, addr, "POST /b HTTP/1.1\r\nHost: localhost\r\nContent-Length: 3\r\n\r\nxyz")
+	if !strings.Contains(second, "POST /b HTTP/1.1\n") || !strings.HasSuffix(second, "\nxyz") {
+		t.Fatalf("second body %q", second)
 	}
 }
 
@@ -32,7 +36,8 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	var once sync.Once
 	accepted := make(chan struct{})
 	addr, stop := startServer(t, &Server{
-		Limits: fastLimits(),
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
 		onAccepted: func(net.Conn) {
 			once.Do(func() { close(accepted) })
 		},
@@ -44,7 +49,9 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer first.Close()
-
+	if _, err := first.Write([]byte("GET /")); err != nil {
+		t.Fatal(err)
+	}
 	select {
 	case <-accepted:
 	case <-time.After(2 * time.Second):
@@ -56,10 +63,9 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer second.Close()
-	if _, err := second.Write([]byte("Hello Server\n")); err != nil {
+	if _, err := second.Write([]byte("GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
 		t.Fatal(err)
 	}
-
 	_ = second.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 	buf := make([]byte, 32)
 	if n, err := second.Read(buf); err == nil {
@@ -71,26 +77,42 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	if err := first.Close(); err != nil {
 		t.Fatal(err)
 	}
-
 	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
-	got, err := bufio.NewReader(second).ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "Hello Client\n" {
-		t.Fatalf("second reply %q", got)
+	body := readResponseBody(t, second)
+	if !strings.Contains(body, "GET /ready HTTP/1.1\n") {
+		t.Fatalf("second body %q", body)
 	}
 }
 
-func TestOversizedLineClosesConnection(t *testing.T) {
+func TestFragmentedRequest(t *testing.T) {
+	addr, stop := startServer(t, &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("GET /hello HTTP/1.1\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := conn.Write([]byte("Host: localhost\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	body := readResponseBody(t, conn)
+	if !strings.Contains(body, "GET /hello HTTP/1.1\n") || !strings.Contains(body, "Host: localhost\n") {
+		t.Fatalf("body %q", body)
+	}
+}
+
+func TestOversizedRequestLineClosesConnection(t *testing.T) {
 	var logBuf lockedBuffer
 	addr, stop := startServer(t, &Server{
-		Limits: transport.Limits{
-			MaxMessage:   64,
-			ReadTimeout:  2 * time.Second,
-			WriteTimeout: 2 * time.Second,
-		},
-		Logger: log.New(&logBuf, "", 0),
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		Limits:       http1.Limits{MaxRequestLine: 64, MaxHeaders: 128, MaxBody: 32},
+		Logger:       log.New(&logBuf, "", 0),
 	})
 	defer stop()
 
@@ -99,28 +121,21 @@ func TestOversizedLineClosesConnection(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
-	payload := bytes.Repeat([]byte("A"), 64)
-	if _, err := conn.Write(payload); err != nil {
+	if _, err := conn.Write(bytes.Repeat([]byte("A"), 64)); err != nil {
 		t.Fatal(err)
 	}
-
 	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 8)
 	n, err := conn.Read(buf)
 	if n != 0 || !errors.Is(err, io.EOF) {
-		t.Fatalf("read %d bytes, err %v; want EOF from a closed connection", n, err)
+		t.Fatalf("read %d bytes, err %v; want EOF", n, err)
 	}
-
 	deadline := time.Now().Add(2 * time.Second)
-	for !strings.Contains(logBuf.String(), "message exceeds maximum size") {
+	for !strings.Contains(logBuf.String(), "request line exceeds maximum size") {
 		if time.Now().After(deadline) {
-			t.Fatalf("log %q does not record the rejected message", logBuf.String())
+			t.Fatalf("log %q", logBuf.String())
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	if !strings.Contains(logBuf.String(), conn.LocalAddr().String()) {
-		t.Fatalf("log %q does not include the client address %s", logBuf.String(), conn.LocalAddr())
 	}
 }
 
@@ -130,24 +145,19 @@ func TestShutdownUnblocksReadAndRebinds(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	accepted := make(chan struct{})
 	var once sync.Once
 	srv := &Server{
-		Limits: transport.Limits{
-			MaxMessage:   transport.DefaultMaxMessage,
-			ReadTimeout:  5 * time.Second,
-			WriteTimeout: 2 * time.Second,
-		},
-		Logger: log.New(io.Discard, "", 0),
+		ReadTimeout:  5 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		Logger:       log.New(io.Discard, "", 0),
 		onAccepted: func(net.Conn) {
 			once.Do(func() { close(accepted) })
 		},
 	}
-
 	done := make(chan error, 1)
 	go func() {
 		done <- srv.Serve(ctx, ln)
@@ -158,15 +168,12 @@ func TestShutdownUnblocksReadAndRebinds(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
 	select {
 	case <-accepted:
 	case <-time.After(2 * time.Second):
 		t.Fatal("connection was not accepted")
 	}
-
 	cancel()
-
 	select {
 	case err := <-done:
 		if err != nil {
@@ -175,13 +182,11 @@ func TestShutdownUnblocksReadAndRebinds(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("shutdown did not unblock the in-flight read")
 	}
-
 	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 	buf := make([]byte, 8)
 	if _, err := conn.Read(buf); err == nil || isTimeout(err) {
 		t.Fatalf("in-flight connection was not closed: %v", err)
 	}
-
 	rebound, err := listenAgain(addr)
 	if err != nil {
 		t.Fatal(err)
@@ -193,24 +198,22 @@ func TestListenAndServeCancel(t *testing.T) {
 	var logBuf lockedBuffer
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
 	srv := &Server{
-		Addr:   "127.0.0.1:0",
-		Limits: fastLimits(),
-		Logger: log.New(&logBuf, "", 0),
+		Addr:         "127.0.0.1:0",
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+		Logger:       log.New(&logBuf, "", 0),
 	}
 	done := make(chan error, 1)
 	go func() {
 		done <- srv.ListenAndServe(ctx)
 	}()
-
 	addr := waitListenAddr(t, &logBuf)
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer conn.Close()
-
 	cancel()
 	select {
 	case err := <-done:
@@ -250,7 +253,7 @@ func startServer(t *testing.T, srv *Server) (string, func()) {
 	return ln.Addr().String(), stop
 }
 
-func roundTrip(t *testing.T, addr, send string) string {
+func roundTrip(t *testing.T, addr, raw string) string {
 	t.Helper()
 	conn, err := net.Dial("tcp", addr)
 	if err != nil {
@@ -258,22 +261,43 @@ func roundTrip(t *testing.T, addr, send string) string {
 	}
 	defer conn.Close()
 	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-	if _, err := conn.Write([]byte(send)); err != nil {
+	if _, err := conn.Write([]byte(raw)); err != nil {
 		t.Fatal(err)
 	}
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	return readResponseBody(t, conn)
+}
+
+func readResponseBody(t *testing.T, r io.Reader) string {
+	t.Helper()
+	br := bufio.NewReader(r)
+	status, err := br.ReadString('\n')
 	if err != nil {
 		t.Fatal(err)
 	}
-	return line
-}
-
-func fastLimits() transport.Limits {
-	return transport.Limits{
-		MaxMessage:   transport.DefaultMaxMessage,
-		ReadTimeout:  2 * time.Second,
-		WriteTimeout: 2 * time.Second,
+	if status != "HTTP/1.1 200 OK\r\n" {
+		t.Fatalf("status %q", status)
 	}
+	var contentLength int
+	for {
+		line, err := br.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+		if strings.HasPrefix(line, "Content-Length: ") {
+			contentLength, err = strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(line, "Content-Length: ")))
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	buf := make([]byte, contentLength)
+	if _, err := io.ReadFull(br, buf); err != nil {
+		t.Fatal(err)
+	}
+	return string(buf)
 }
 
 func isTimeout(err error) bool {

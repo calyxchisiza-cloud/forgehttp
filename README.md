@@ -15,7 +15,15 @@ Content-Length: 34
 
 `Content-Length` is the number of body bytes. HTTP/1.1 stays open unless the request says `Connection: close`. HTTP/1.0 closes unless the request says `Connection: keep-alive`. A connection that sends nothing for 30 seconds is closed. A request that stalls after the first byte is limited by the read deadline and answered with 408. An unknown path is 404. A known path with another method is 405. A malformed request receives an error status such as 400, 413, 431, 501, or 505, and that connection closes. Two clients can be served at the same time. Past 100 open connections, further clients wait in the listen queue until one finishes. See [docs/architecture.md](docs/architecture.md).
 
-The small REST API is `examples/rest-api`:
+The console is a page this server returns. It shows the open connections, the last traces, and the users list.
+
+```
+go run ./examples/console
+```
+
+Open `http://127.0.0.1:8080/`.
+
+The small REST API without the page is `examples/rest-api`:
 
 ```
 go run ./examples/rest-api

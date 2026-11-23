@@ -406,6 +406,44 @@ func TestShutdownFinishesCurrentResponse(t *testing.T) {
 	}
 }
 
+func TestSnapshotCountsAKeptConnection(t *testing.T) {
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second, IdleTimeout: 2 * time.Second}
+	registerText(t, srv, "GET", "/one", "one")
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := conn.Write([]byte("GET /one HTTP/1.1\r\nHost: localhost\r\n\r\n")); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, body := readMessage(t, conn); body != "one" {
+		t.Fatalf("body %q", body)
+	}
+	deadline := time.Now().Add(time.Second)
+	var snap Snapshot
+	for {
+		snap = srv.Snapshot()
+		ready := len(snap.Traces) == 1 && snap.Traces[0].Status == 200 && snap.Traces[0].Connection == "keep-alive"
+		for _, c := range snap.Connections {
+			if ready && c.Requests == 1 && c.Stage == "reading" {
+				if snap.MaxConns != 100 || snap.Active < 1 {
+					t.Fatalf("snapshot %+v", snap)
+				}
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("snapshot %+v", snap)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestFragmentedRequest(t *testing.T) {
 	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
 	registerHello(t, srv)

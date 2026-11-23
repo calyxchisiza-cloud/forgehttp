@@ -72,13 +72,25 @@ type Server struct {
 	// request is read. Tests use it to observe that a connection was accepted.
 	onAccepted func(net.Conn)
 
+	// SkipTrace, when it returns true, omits that request from Snapshot and
+	// from the connection's request count. The request is still served.
+	SkipTrace func(method, target string) bool
+
 	routes *router.Router
 
 	mu      sync.Mutex
 	closing bool
-	conns   map[net.Conn]connStage
+	conns   map[net.Conn]*connState
+	traces  []Trace
 	slots   chan struct{}
 	wg      sync.WaitGroup
+}
+
+// connState is one accepted connection.
+type connState struct {
+	stage    connStage
+	remote   string
+	requests int
 }
 
 // ListenAndServe binds Addr and serves until ctx is cancelled or Accept fails.
@@ -115,7 +127,7 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	}()
 
 	s.mu.Lock()
-	s.conns = make(map[net.Conn]connStage)
+	s.conns = make(map[net.Conn]*connState)
 	s.slots = make(chan struct{}, s.maxConns())
 	s.mu.Unlock()
 
@@ -204,23 +216,57 @@ func (s *Server) serve(ctx context.Context, conn net.Conn) {
 				resp = http1.Text(408, "request timeout")
 			}
 			_ = s.writeResponse(conn, resp)
+			s.remember(Trace{
+				Remote:     conn.RemoteAddr().String(),
+				Status:     resp.Status,
+				Connection: "close",
+				Note:       err.Error(),
+			})
 			return
 		}
 
 		// The request is complete. Shutdown must not close this socket until
 		// the response below has been written.
-		s.markStage(conn, stageServing)
+		quiet := s.skips(req.Method, req.Target)
+		s.markStage(conn, stageServing, !quiet)
 		s.logger().Printf("%s %s %s", req.Method, req.Target, conn.RemoteAddr())
 		req.SetContext(ctx)
 		resp := s.router().Serve(req)
+		if resp == nil {
+			resp = http1.Text(500, "nil response")
+		}
 		resp.Persist = keepAlive(req) && ctx.Err() == nil && !s.isClosing()
+		token := "close"
+		if resp.Persist {
+			token = "keep-alive"
+		}
 		if err := s.writeResponse(conn, resp); err != nil {
+			if !quiet {
+				s.remember(Trace{
+					Remote: conn.RemoteAddr().String(),
+					Method: req.Method,
+					Target: req.Target,
+					Proto:  req.Proto,
+					Status: resp.Status,
+					Note:   err.Error(),
+				})
+			}
 			return
+		}
+		if !quiet {
+			s.remember(Trace{
+				Remote:     conn.RemoteAddr().String(),
+				Method:     req.Method,
+				Target:     req.Target,
+				Proto:      req.Proto,
+				Status:     resp.Status,
+				Connection: token,
+			})
 		}
 		if !resp.Persist {
 			return
 		}
-		s.markStage(conn, stageReading)
+		s.markStage(conn, stageReading, false)
 	}
 }
 
@@ -307,8 +353,8 @@ func (s *Server) beginShutdown(ln net.Listener) {
 	s.mu.Lock()
 	s.closing = true
 	var waiting []net.Conn
-	for conn, stage := range s.conns {
-		if stage == stageReading {
+	for conn, st := range s.conns {
+		if st.stage == stageReading {
 			waiting = append(waiting, conn)
 		}
 	}
@@ -330,15 +376,24 @@ func (s *Server) track(conn net.Conn) bool {
 	if s.closing {
 		return false
 	}
-	s.conns[conn] = stageReading
+	remote := ""
+	if conn.RemoteAddr() != nil {
+		remote = conn.RemoteAddr().String()
+	}
+	s.conns[conn] = &connState{stage: stageReading, remote: remote}
 	return true
 }
 
-func (s *Server) markStage(conn net.Conn, stage connStage) {
+func (s *Server) markStage(conn net.Conn, stage connStage, count bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if _, ok := s.conns[conn]; ok {
-		s.conns[conn] = stage
+	st := s.conns[conn]
+	if st == nil {
+		return
+	}
+	st.stage = stage
+	if count {
+		st.requests++
 	}
 }
 
@@ -346,6 +401,13 @@ func (s *Server) untrack(conn net.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.conns, conn)
+}
+
+func (s *Server) skips(method, target string) bool {
+	if s.SkipTrace == nil {
+		return false
+	}
+	return s.SkipTrace(method, target)
 }
 
 func (s *Server) isClosing() bool {

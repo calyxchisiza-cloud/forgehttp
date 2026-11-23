@@ -1,6 +1,6 @@
 # ForgeHTTP architecture
 
-Phase 1 accepts one TCP connection at a time and shuts down on context cancellation. Phase 2 parses one HTTP/1 request from that connection. Phase 3 serializes an HTTP/1.1 response.
+Phase 1 accepts one TCP connection at a time and shuts down on context cancellation. Phase 2 parses one HTTP/1 request. Phase 3 serializes an HTTP/1.1 response. Phase 4 routes that request to a handler by exact method and path.
 
 ## Components
 
@@ -10,10 +10,10 @@ Phase 1 accepts one TCP connection at a time and shuts down on context cancellat
 | Connection manager | Deadlines, the active connection, shutdown | One connection at a time, deadlines, context shutdown |
 | HTTP parser | Request line, headers, body, framing | `http1.ReadRequest` |
 | Request handler | Validate a parsed request beyond framing | Later |
-| Router | Method and path to application logic | Later |
+| Router | Method and path to application logic | `router.Router`, exact paths only |
 | Response writer | Status, headers, body, `Content-Length` | `Response.Write` |
 
-`transport` opens sockets. `protocol/http1` reads requests and writes responses. `server` owns the accept loop, deadlines, and shutdown. `net/http` is not part of this server.
+`transport` opens sockets. `protocol/http1` reads requests and writes responses. `router` matches an exact method and path. `server` owns the accept loop, deadlines, and shutdown. `net/http` is not part of this server.
 
 ## Process
 
@@ -26,7 +26,7 @@ ListenAndServe
   net.Listen("tcp", 127.0.0.1:8080)
         |
         v
-Accept ---- one connection ---- ReadRequest ---- Response.Write ---- Close
+Accept ---- one connection ---- ReadRequest ---- Router ---- Response.Write ---- Close
   ^                                                                |
   +----------------------------------------------------------------+
 ```
@@ -50,6 +50,14 @@ A client that has not finished its request is served before the next accepted cl
 - Idle timeout: 30 seconds. The server uses 30 seconds as the read deadline on the one active connection.
 - Chunked transfer encoding stays unsupported until a chunked decoder exists.
 - `{"message":"Hello from ForgeHTTP"}` is 34 bytes. The phase 3 response sends `Content-Length: 34`.
+
+## Routing
+
+- `Handle` registers one uppercase method and one exact path, such as `GET` and `/api/users`.
+- The query string is not part of the match. `/api/users?x=1` uses the path `/api/users`.
+- An unknown path is 404. A known path with another method is 405, and the response includes `Allow`.
+- The server sets the request context from its own context before the handler runs.
+- Route parameters are a later phase.
 
 ## Response rules
 

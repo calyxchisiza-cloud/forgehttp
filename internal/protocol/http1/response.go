@@ -1,6 +1,9 @@
 package http1
 
-import "errors"
+import (
+	"encoding/json"
+	"errors"
+)
 
 // HelloMessage is the sample JSON body. It is 34 bytes.
 const HelloMessage = `{"message":"Hello from ForgeHTTP"}`
@@ -36,6 +39,16 @@ func JSON(status int, body []byte) *Response {
 		Header: Header{"Content-Type": {"application/json"}},
 		Body:   body,
 	}
+}
+
+// JSONData marshals v and builds a JSON response.
+// A marshal failure becomes a 500 text response.
+func JSONData(status int, v any) *Response {
+	body, err := json.Marshal(v)
+	if err != nil {
+		return Text(500, "json encode failed")
+	}
+	return JSON(status, body)
 }
 
 var statusText = map[int]string{

@@ -1,6 +1,8 @@
 # ForgeHTTP
 
-Phase 3 writes HTTP/1.1 responses. The server still accepts one TCP connection at a time on `127.0.0.1:8080`. A valid request receives:
+Phase 4 routes by exact method and path. The server still accepts one TCP connection at a time on `127.0.0.1:8080`.
+
+`go run ./cmd/forgehttp` registers `GET /` and `GET /hello`. A matching request receives:
 
 ```
 HTTP/1.1 200 OK
@@ -11,7 +13,18 @@ Connection: close
 {"message":"Hello from ForgeHTTP"}
 ```
 
-`Content-Length` is the number of body bytes. A malformed request receives an error status such as 400, 413, 431, 501, or 505. Routing and a goroutine per connection are later phases. See [docs/architecture.md](docs/architecture.md).
+`Content-Length` is the number of body bytes. An unknown path is 404. A known path with another method is 405. A malformed request receives an error status such as 400, 413, 431, 501, or 505. A goroutine per connection is a later phase. See [docs/architecture.md](docs/architecture.md).
+
+The small REST API is `examples/rest-api`:
+
+```
+go run ./examples/rest-api
+```
+
+```
+curl http://127.0.0.1:8080/api/users
+curl -H "Content-Type: application/json" -d "{\"name\":\"Ada\"}" http://127.0.0.1:8080/api/users
+```
 
 A request line is limited to 8 KiB, the header block to 32 KiB, and a `Content-Length` body to 1 MB. `Transfer-Encoding` is rejected and its body is not read. A chunked body is never treated as a `Content-Length` body.
 

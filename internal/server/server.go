@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"forgehttp/internal/protocol/http1"
+	"forgehttp/internal/router"
 	"forgehttp/internal/transport"
 )
 
@@ -38,8 +39,10 @@ type Server struct {
 	Logger *log.Logger
 
 	// onAccepted, when set, runs after a connection is tracked and before the
-	// line exchange. Tests use it to observe the sequential loop.
+	// request is read. Tests use it to observe the sequential loop.
 	onAccepted func(net.Conn)
+
+	routes *router.Router
 
 	mu      sync.Mutex
 	closing bool
@@ -89,11 +92,16 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			}
 			return err
 		}
-		s.serve(conn)
+		s.serve(ctx, conn)
 	}
 }
 
-func (s *Server) serve(conn net.Conn) {
+// Handle registers an exact method and path. Register routes before serving traffic.
+func (s *Server) Handle(method, path string, h router.Handler) error {
+	return s.router().Handle(method, path, h)
+}
+
+func (s *Server) serve(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
 	if !s.track(conn) {
 		return
@@ -118,7 +126,8 @@ func (s *Server) serve(conn net.Conn) {
 		resp = errorResponse(err)
 	} else {
 		s.logger().Printf("%s %s %s", req.Method, req.Target, conn.RemoteAddr())
-		resp = http1.JSON(200, []byte(http1.HelloMessage))
+		req.SetContext(ctx)
+		resp = s.router().Serve(req)
 	}
 	if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout())); err != nil {
 		s.logger().Printf("%s: %v", conn.RemoteAddr(), err)
@@ -144,6 +153,15 @@ func errorResponse(err error) *http1.Response {
 	default:
 		return http1.Text(400, "bad request")
 	}
+}
+
+func (s *Server) router() *router.Router {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.routes == nil {
+		s.routes = router.New()
+	}
+	return s.routes
 }
 
 func (s *Server) readTimeout() time.Duration {

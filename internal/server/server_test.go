@@ -19,7 +19,9 @@ import (
 )
 
 func TestTwoClientsSequentially(t *testing.T) {
-	addr, stop := startServer(t, &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
+	registerHello(t, srv)
+	addr, stop := startServer(t, srv)
 	defer stop()
 
 	first := roundTrip(t, addr, "GET /a HTTP/1.1\r\nHost: localhost\r\n\r\n")
@@ -32,13 +34,15 @@ func TestTwoClientsSequentially(t *testing.T) {
 func TestSecondClientWaitsForTheFirst(t *testing.T) {
 	var once sync.Once
 	accepted := make(chan struct{})
-	addr, stop := startServer(t, &Server{
+	srv := &Server{
 		ReadTimeout:  2 * time.Second,
 		WriteTimeout: 2 * time.Second,
 		onAccepted: func(net.Conn) {
 			once.Do(func() { close(accepted) })
 		},
-	})
+	}
+	registerHello(t, srv)
+	addr, stop := startServer(t, srv)
 	defer stop()
 
 	first, err := net.Dial("tcp", addr)
@@ -82,7 +86,9 @@ func TestSecondClientWaitsForTheFirst(t *testing.T) {
 }
 
 func TestFragmentedRequest(t *testing.T) {
-	addr, stop := startServer(t, &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second})
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
+	registerHello(t, srv)
+	addr, stop := startServer(t, srv)
 	defer stop()
 
 	conn, err := net.Dial("tcp", addr)
@@ -132,6 +138,32 @@ func TestOversizedRequestLineClosesConnection(t *testing.T) {
 			t.Fatalf("log %q", logBuf.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestRoutesAndRequestContext(t *testing.T) {
+	srv := &Server{ReadTimeout: 2 * time.Second, WriteTimeout: 2 * time.Second}
+	if err := srv.Handle("GET", "/ctx", func(req *http1.Request) *http1.Response {
+		if req.Context().Err() != nil {
+			return http1.Text(500, "cancelled")
+		}
+		return http1.Text(200, "ok")
+	}); err != nil {
+		t.Fatal(err)
+	}
+	addr, stop := startServer(t, srv)
+	defer stop()
+
+	if got := roundTrip(t, addr, "GET /ctx HTTP/1.1\r\nHost: localhost\r\n\r\n"); got != "ok" {
+		t.Fatalf("context handler body %q", got)
+	}
+	missing := roundTripStatus(t, addr, "GET /missing HTTP/1.1\r\nHost: localhost\r\n\r\n")
+	if missing.status != "HTTP/1.1 404 Not Found\r\n" || missing.body != "not found" {
+		t.Fatalf("missing %#v", missing)
+	}
+	wrong := roundTripStatus(t, addr, "POST /ctx HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n")
+	if wrong.status != "HTTP/1.1 405 Method Not Allowed\r\n" || wrong.body != "method not allowed" {
+		t.Fatalf("method %#v", wrong)
 	}
 }
 
@@ -235,6 +267,20 @@ func TestListenAndServeCancel(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("ListenAndServe did not return")
+	}
+}
+
+func registerHello(t *testing.T, srv *Server) {
+	t.Helper()
+	h := func(*http1.Request) *http1.Response {
+		return http1.JSON(200, []byte(http1.HelloMessage))
+	}
+	for _, path := range []string{"/a", "/b", "/ready", "/hello"} {
+		for _, method := range []string{"GET", "POST"} {
+			if err := srv.Handle(method, path, h); err != nil {
+				t.Fatal(err)
+			}
+		}
 	}
 }
 

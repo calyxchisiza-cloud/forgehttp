@@ -1,6 +1,6 @@
 # ForgeHTTP
 
-Phase 6 keeps an HTTP/1.1 connection open for the next request. Each connection still runs on its own goroutine, and the accept loop allows 100 connections at once.
+ForgeHTTP is an HTTP/1.1 server. Each connection runs on its own goroutine, stays open for the next request, and the accept loop allows 100 connections at once.
 
 `go run ./cmd/forgehttp` registers `GET /` and `GET /hello`. A matching request receives:
 
